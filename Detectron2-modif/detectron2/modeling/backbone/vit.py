@@ -6,11 +6,18 @@ import torch.nn as nn
 
 from detectron2.layers import CNNBlockBase, Conv2d, get_norm
 from detectron2.modeling.backbone.fpn import _assert_strides_are_log2_contiguous
+from detectron2.modeling.backbone.tome.merge import (
+    bipartite_soft_matching,
+    kth_bipartite_soft_matching,
+    random_bipartite_soft_matching,
+    merge_source, merge_wavg,)
+from detectron2.modeling.backbone.tome.utils import parse_r
 
 from .backbone import Backbone
 from .utils import (
     PatchEmbed,
     add_decomposed_rel_pos,
+    get_rel_pos,
     get_abs_pos,
     window_partition,
     window_unpartition,
@@ -20,6 +27,41 @@ logger = logging.getLogger(__name__)
 
 
 __all__ = ["ViT", "SimpleFeaturePyramid", "get_vit_lr_decay_rate"]
+
+ENABLE_TOME = True
+
+print("TOME ENABLESTATUS", "u"*10,ENABLE_TOME)
+
+def tome_add_decomposed_rel_pos(attn, q, rel_pos_h, rel_pos_w, q_size, k_size):
+    """
+    Calculate decomposed Relative Positional Embeddings from :paper:`mvitv2`.
+    https://github.com/facebookresearch/mvit/blob/19786631e330df9f3622e5402b4a419a263a2c80/mvit/models/attention.py   # noqa B950
+    Args:
+        attn (Tensor): attention map.
+        q (Tensor): query q in the attention layer with shape (B, q_h * q_w, C).
+        rel_pos_h (Tensor): relative position embeddings (Lh, C) for height axis.
+        rel_pos_w (Tensor): relative position embeddings (Lw, C) for width axis.
+        q_size (Tuple): spatial sequence size of query q with (q_h, q_w).
+        k_size (Tuple): spatial sequence size of key k with (k_h, k_w).
+
+    Returns:
+        attn (Tensor): attention map with added relative positional embeddings.
+    """
+    q_h, q_w = q_size
+    k_h, k_w = k_size
+    Rh = get_rel_pos(q_h, k_h, rel_pos_h)
+    Rw = get_rel_pos(q_w, k_w, rel_pos_w)
+
+    B, _, dim = q.shape
+    r_q = q.reshape(B, q_h, q_w, dim)
+    rel_h = torch.einsum("bhwc,hkc->bhwk", r_q, Rh)
+    rel_w = torch.einsum("bhwc,wkc->bhwk", r_q, Rw)
+
+    attn = (
+        attn.view(B, q_h, q_w, k_h, k_w) + rel_h[:, :, :, :, None] + rel_w[:, :, :, None, :]
+    ).view(B, q_h * q_w, k_h * k_w)
+
+    return attn
 
 
 class Attention(nn.Module):
@@ -62,17 +104,35 @@ class Attention(nn.Module):
                 nn.init.trunc_normal_(self.rel_pos_h, std=0.02)
                 nn.init.trunc_normal_(self.rel_pos_w, std=0.02)
 
+
     def forward(self, x):
         B, H, W, _ = x.shape
+
+        # r_fac = W//4
+
+        if   W==14: kskip = 2
+        elif W==64: kskip = 8
+
         # qkv with shape (3, B, nHead, H * W, C)
         qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
         # q, k, v with shape (B * nHead, H * W, C)
         q, k, v = qkv.reshape(3, B * self.num_heads, H * W, -1).unbind(0)
 
+        if ENABLE_TOME:
+            # k, v = self.forward_tome_KV(q, k, v, r=H*r_fac)
+            k, v = self.forward_kth_tome_KV(q, k, v, kskip=kskip)
+
+        # print("K shape", k.shape)
         attn = (q * self.scale) @ k.transpose(-2, -1)
 
+        # print("ATT SHAPE", attn.shape)
+        # print("K SHAPE", k.shape)
+
         if self.use_rel_pos:
-            attn = add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (H, W), (H, W))
+            QH, QW = H, W
+            KH, KW =(H, W//kskip) if ENABLE_TOME else (H,W)
+            # KH, KW =(H, W-r_fac) if ENABLE_TOME else (H,W)
+            attn = tome_add_decomposed_rel_pos(attn, q, self.rel_pos_h, self.rel_pos_w, (QH, QW), (KH, KW))
 
         attn = attn.softmax(dim=-1)
         x = (attn @ v).view(B, self.num_heads, H, W, -1).permute(0, 2, 3, 1, 4).reshape(B, H, W, -1)
@@ -80,6 +140,26 @@ class Attention(nn.Module):
 
         return x
 
+    def forward_tome_KV(self, q, k, v, r):
+        metric = k.mean(0).unsqueeze(0)
+        # print("Metric Shape", metric.shape)
+        merge, _ = bipartite_soft_matching( metric, r, False, False )
+        # merge, _ = random_bipartite_soft_matching(metric, r)
+        k, _ = merge_wavg(merge, k, None)
+        v, _ = merge_wavg(merge, v, None)
+        # print("IN TOME BLOCK", k.shape, v.shape)
+
+        return k, v
+
+    def forward_kth_tome_KV(self, q, k, v, kskip):
+        metric = k.mean(0).unsqueeze(0)
+        # print("Metric Shape", metric.shape)
+        merge, _ = kth_bipartite_soft_matching( metric, kskip)
+        k, _ = merge_wavg(merge, k, None)
+        v, _ = merge_wavg(merge, v, None)
+        # print("IN TOME BLOCK", k.shape, v.shape)
+
+        return k, v
 
 class ResBottleneckBlock(CNNBlockBase):
     """
@@ -214,7 +294,6 @@ class Block(nn.Module):
         if self.window_size > 0:
             H, W = x.shape[1], x.shape[2]
             x, pad_hw = window_partition(x, self.window_size)
-
         x = self.attn(x)
         # Reverse window partition
         if self.window_size > 0:
