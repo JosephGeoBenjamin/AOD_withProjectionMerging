@@ -15,3 +15,6 @@ In this paper, inspired by Token Merging for image classification, we propose tw
 
 Optional Not entirely needed
 `python -m pip install -e Detectron2-modif`
+
+## Acknowledgement
+Completed as part of Project work for CV703 Course at MBZUAI. The codebase is based on the [Detectron](https://github.com/facebookresearch/detectron2) with modifications to include [Token Merging](https://github.com/facebookresearch/ToMe)
